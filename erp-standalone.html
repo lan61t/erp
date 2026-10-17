@@ -206,7 +206,156 @@ document.addEventListener("keydown", function (e) {
 // ════════════════════════════════════════════════════════════════════════════
 const SUPABASE_URL = "https://YOUR-PROJECT.supabase.co"; // TODO: set your own Supabase project URL
 const SUPABASE_ANON_KEY = "YOUR-SUPABASE-ANON-KEY"; // TODO: set your own Supabase anon (public) key
-const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// ════════════════════════════════════════════════════════════════════════════
+// DEMO MODE — active only while SUPABASE_URL is still the "YOUR-PROJECT" placeholder.
+// Replaces Supabase with a tiny in-browser backend (localStorage) so the app can be tried
+// without any account or server. Data stays in this browser only. Set a real SUPABASE_URL
+// and SUPABASE_ANON_KEY above to switch to the real backend (this block is then unused).
+// Demo logins: admin/admin123 (owner), sales/sales123 (sales_manager), gudang/gudang123 (logistic)
+// ════════════════════════════════════════════════════════════════════════════
+const DEMO_MODE = /YOUR-PROJECT/.test(SUPABASE_URL);
+function createDemoClient() {
+  const LS = "erp_demo_db_v1";
+  const uid = () => (crypto.randomUUID ? crypto.randomUUID() : "u" + Date.now() + Math.random().toString(16).slice(2));
+  const load = () => {
+    try { const d = JSON.parse(localStorage.getItem(LS)); if (d && d.profiles) return d; } catch (e) {}
+    const mk = (username, nama, role, password) => ({ id: uid(), username, nama, role, aktif: true, custom_modules: null, created_at: new Date().toISOString(), _pw: password });
+    const d = { profiles: [mk("admin", "Demo Admin", "owner", "admin123"), mk("sales", "Demo Sales", "sales_manager", "sales123"), mk("gudang", "Demo Gudang", "logistic", "gudang123")], erp_data: [], session: null };
+    localStorage.setItem(LS, JSON.stringify(d));
+    return d;
+  };
+  const save = d => localStorage.setItem(LS, JSON.stringify(d));
+  const clean = r => { const c = { ...r }; delete c._pw; return c; };
+  const clone = x => (x === undefined ? x : JSON.parse(JSON.stringify(x)));
+  const pkOf = t => (t === "erp_data" ? "key" : "id");
+  const sessionOf = d => d.session ? { access_token: "demo-token", user: { id: d.session.id, email: d.session.email } } : null;
+  function builder(table) {
+    const st = { op: "select", payload: null, opts: null, filters: [], orderBy: null, single: null, returnRows: false };
+    const b = {
+      select() { if (st.op !== "select") st.returnRows = true; return b; },
+      update(p) { st.op = "update"; st.payload = p; return b; },
+      insert(p) { st.op = "insert"; st.payload = p; return b; },
+      upsert(p, o) { st.op = "upsert"; st.payload = p; st.opts = o || {}; return b; },
+      delete() { st.op = "delete"; return b; },
+      eq(c, v) { st.filters.push(r => r[c] === v); return b; },
+      match(o) { Object.keys(o).forEach(c => st.filters.push(r => r[c] === o[c])); return b; },
+      order(c, o) { st.orderBy = { c, asc: !o || o.ascending !== false }; return b; },
+      limit() { return b; },
+      maybeSingle() { st.single = "maybe"; return b; },
+      single() { st.single = "one"; return b; },
+      then(res, rej) { return Promise.resolve().then(run).then(res, rej); }
+    };
+    function run() {
+      const d = load();
+      const rows = d[table];
+      if (!rows) return { data: null, error: { message: "Tabel tidak ada: " + table } };
+      const pk = pkOf(table);
+      const match = r => st.filters.every(f => f(r));
+      let out = [];
+      if (st.op === "select") out = rows.filter(match);
+      else if (st.op === "update") {
+        rows.filter(match).forEach(r => { Object.assign(r, clone(st.payload)); out.push(r); });
+        save(d);
+      } else if (st.op === "insert" || st.op === "upsert") {
+        const list = Array.isArray(st.payload) ? st.payload : [st.payload];
+        for (const p of list) {
+          const key = st.opts && st.opts.onConflict ? st.opts.onConflict : pk;
+          const ex = rows.find(r => r[key] === p[key]);
+          if (ex) {
+            if (st.op === "insert") return { data: null, error: { message: "duplicate key value violates unique constraint" } };
+            if (!(st.opts && st.opts.ignoreDuplicates)) Object.assign(ex, clone(p));
+            out.push(ex);
+          } else {
+            const n = clone(p);
+            if (table === "profiles" && !n.id) n.id = uid();
+            if (table === "erp_data" && !n.updated_at) n.updated_at = new Date().toISOString();
+            rows.push(n); out.push(n);
+          }
+        }
+        save(d);
+      } else if (st.op === "delete") {
+        const keep = rows.filter(r => !match(r));
+        out = rows.filter(match);
+        d[table] = keep; save(d);
+      }
+      if (st.orderBy) { const { c, asc } = st.orderBy; out = out.slice().sort((a, z) => (a[c] > z[c] ? 1 : a[c] < z[c] ? -1 : 0) * (asc ? 1 : -1)); }
+      out = clone(out.map(r => (table === "profiles" ? clean(r) : r)));
+      if (st.op !== "select" && !st.returnRows) return { data: null, error: null };
+      if (st.single) {
+        if (out.length > 1 || (st.single === "one" && out.length === 0)) return { data: null, error: { message: "Expected a single row" } };
+        return { data: out[0] || null, error: null };
+      }
+      return { data: out, error: null };
+    }
+    return b;
+  }
+  const client = {
+    from: builder,
+    rpc(name, args) {
+      return Promise.resolve().then(() => {
+        if (name !== "erp_data_cas") return { data: null, error: { message: "Fungsi tidak ada: " + name } };
+        const d = load();
+        const row = d.erp_data.find(r => r.key === args.p_key);
+        const now = new Date().toISOString();
+        if (!row) {
+          d.erp_data.push({ key: args.p_key, data: clone(args.p_new_data), updated_at: now });
+          save(d);
+          return { data: [{ success: true, current_updated_at: now, current_data: null }], error: null };
+        }
+        if (row.updated_at === args.p_expected_updated_at) {
+          row.data = clone(args.p_new_data); row.updated_at = now;
+          save(d);
+          return { data: [{ success: true, current_updated_at: now, current_data: null }], error: null };
+        }
+        return { data: [{ success: false, current_updated_at: row.updated_at, current_data: clone(row.data) }], error: null };
+      });
+    },
+    auth: {
+      async signInWithPassword({ email, password }) {
+        const d = load();
+        const p = d.profiles.find(r => r.username + "@foresta.local" === String(email).toLowerCase() && r._pw === password);
+        if (!p) return { data: { user: null, session: null }, error: { message: "Invalid login credentials" } };
+        d.session = { id: p.id, email: String(email).toLowerCase() };
+        save(d);
+        return { data: { user: { id: p.id, email: d.session.email }, session: sessionOf(d) }, error: null };
+      },
+      async getSession() { return { data: { session: sessionOf(load()) }, error: null }; },
+      async signOut() { const d = load(); d.session = null; save(d); return { error: null }; },
+      async updateUser({ password }) {
+        const d = load();
+        const p = d.session && d.profiles.find(r => r.id === d.session.id);
+        if (!p) return { data: null, error: { message: "Not logged in" } };
+        p._pw = password; save(d);
+        return { data: { user: { id: p.id } }, error: null };
+      },
+      onAuthStateChange() { return { data: { subscription: { unsubscribe() {} } } }; }
+    }
+  };
+  // Stand-in for the "create-user" Edge Function (used by Manajemen User > Tambah User)
+  const realFetch = window.fetch.bind(window);
+  window.fetch = (url, init) => {
+    if (typeof url === "string" && url.indexOf("/functions/v1/create-user") !== -1) {
+      const body = JSON.parse((init && init.body) || "{}");
+      const d = load();
+      const json = (obj, status) => Promise.resolve(new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } }));
+      if (d.profiles.some(r => r.username === body.username)) return json({ error: "Username sudah dipakai" }, 400);
+      d.profiles.push({ id: uid(), username: body.username, nama: body.nama, role: body.role, aktif: true, custom_modules: null, created_at: new Date().toISOString(), _pw: body.password });
+      save(d);
+      return json({ ok: true }, 200);
+    }
+    return realFetch(url, init);
+  };
+  // Small badge so nobody mistakes the demo for a real installation
+  window.addEventListener("DOMContentLoaded", () => {
+    const el = document.createElement("div");
+    el.style.cssText = "position:fixed;left:8px;bottom:8px;z-index:99999;background:#fef3c7;color:#78350f;border:1px solid #f59e0b;border-radius:8px;padding:6px 10px;font:12px system-ui;box-shadow:0 2px 8px #0003;max-width:260px";
+    el.innerHTML = "<b>DEMO MODE</b> — data only in this browser.<br>Login: admin / admin123<br><a href='#' style='color:#92400e'>Reset demo data</a>";
+    el.querySelector("a").onclick = e => { e.preventDefault(); if (confirm("Hapus semua data demo dan mulai ulang?")) { localStorage.removeItem(LS); Object.keys(localStorage).filter(k => k.indexOf("erp_cache_") === 0).forEach(k => localStorage.removeItem(k)); location.reload(); } };
+    document.body.appendChild(el);
+  });
+  return client;
+}
+const sb = DEMO_MODE ? createDemoClient() : window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // Resolves once we have a confirmed, authenticated Supabase session. All data
 // hooks (usePersisted) wait on this before touching the database, so nothing
